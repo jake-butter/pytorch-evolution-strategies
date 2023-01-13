@@ -1,2 +1,2 @@
 # pytorch-evolution-strategies
-Simple, multi-threaded implementation of ES using PyTorch
+Simple, gym-compatible, multi-threaded implementation of ES using PyTorch
