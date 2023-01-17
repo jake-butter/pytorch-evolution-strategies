@@ -1,19 +1,29 @@
 import datetime
 import os
-from collections import namedtuple
 import numpy as np
+import scipy.stats as ss
 import torch
+import torch.multiprocessing as mp
 import gym
+from worker import Worker, WorkerInput, sample_noise
+from network import ESPolicyNetwork
+from plot import plot
 
 # Params
-MAX_WORKERS = 128
-ES_POP = 512
-ES_LR = 0.01
-ES_SIG = 0.1
+MAX_WORKERS = 12 # Number of concurrent worker processes to use during training
+ES_POP = 512 # Number of policy mutations to generate per iteration
+ES_LR = 0.01 # Learning rate
+ES_SIG = 0.1 # Mutation standard deviation
+MAX_I = 10000 # Maximum number of training iterations
+TEST_E = 10 # Number of testing episodes over which to get average performance
+TEST_F = 10 # Interval between tests
+
+ENV_NAME = "Acrobot-v1" # Gym environment to train on
+ENV_TRUNC = 500 # Max episode length
+REW_THR = 0 # Average test reward threshold at which to stop training
 
 # Globals
 out_dir = "./runs/"
-
 
 def main():
     # Logging
@@ -22,127 +32,110 @@ def main():
     out_dir += now.strftime("%y%m%d%H%M%S") + "/"
     os.mkdir(out_dir)
     with open(out_dir + "log_train.txt", "a") as f:
-        f.write("{},{},{},{},{}\n".format("e", "n", "rew_avg", "rew_min", "rew_max"))
-    os.mkdir(out_dir + "checkpoints/")
+        f.write("{},{},{},{}\n".format("i", "rew_avg", "rew_min", "rew_max"))
+    with open(out_dir + "log_test.txt", "a") as f:
+        f.write("{},{}\n".format("i", "rew_avg"))
 
     # Test environment
-    test_env = CartPoleFlip()
+    test_env = gym.make(ENV_NAME)
 
-    # Agent
-    agent = Agent(test_env.observation_space.shape, test_env.action_space.n, SUB_POP, SEL_POP, MAX_WORKERS, SUB_N, SUB_LR, SUB_SIG, SEL_LR, SEL_SIG)
-    for _ in range(SUB_N):
-        agent.add_policy()
+    # Agent network and optimiser
+    net = ESPolicyNetwork(test_env.observation_space.shape, test_env.action_space.n)
+    optimiser = torch.optim.Adam(net.parameters(), lr = ES_LR)
 
-    e = 0
-    while True:
-        print("\n--- {} ---".format(e))
+    # Workers
+    input_queue = mp.Queue(maxsize = ES_POP)
+    output_queue = mp.Queue(maxsize = ES_POP)
+    workers = []
+    for _ in range(MAX_WORKERS):
+        worker = Worker(input_queue, output_queue, ENV_NAME, ENV_TRUNC)
+        worker.start()
+        workers.append(worker)
 
-        # Optimise each subpolicy
-        for n in range(SUB_N):
-            print("Training subpolicy {}...".format(n))
-            # Step
-            rew_avg, rew_min, rew_max, rew_avg_reg, rew_min_reg, rew_max_reg, rew_avg_flip, rew_min_flip, rew_max_flip, sel_avg_reg, sel_avg_flip = agent.es_step(n)
-            
-            # Logging
-            print("Reward Avg: {}, Max: {}, Diff: {}".format(rew_avg, rew_max, rew_avg_reg - rew_avg_flip))
-            with open(out_dir + "log_train.txt", "a") as f:
-                f.write("{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(e, n, rew_avg, rew_min, rew_max, rew_avg_reg, rew_min_reg, rew_max_reg, rew_avg_flip, rew_min_flip, rew_max_flip, sel_avg_reg, sel_avg_flip))
+    # Training loop
+    for i in range(MAX_I):
+        print("\n--- {} ---".format(i))
+
+        # Queue up inputs for workers
+        policy_params = net.state_dict()
+        for _ in range(ES_POP):
+            input = WorkerInput(policy_params, ES_SIG)
+            input_queue.put(input)
         
-        # Optimiser selector
-        print("///")
-        print("Training critic...")
-        rew_avg, rew_min, rew_max, err_avg, err_min, err_max, sel_avg_reg, sel_min_reg, sel_max_reg, sel_avg_flip, sel_min_flip, sel_max_flip = agent.es_step_selector()
+        # Get seeds and rewards from workers
+        batch_noise = []
+        batch_reward = []
+        for _ in range(ES_POP):
+            output = output_queue.get()
+            np.random.seed(output.seed)
+            noise = sample_noise(net)
+            batch_noise.append(noise)
+            batch_reward.append(output.total_reward)
+    
+        reward_avg = np.mean(batch_reward)
+        reward_min = np.min(batch_reward)
+        reward_max = np.max(batch_reward)
+
+        # Normalise rewards
+        ranked = ss.rankdata(batch_reward)
+        norm_reward = (ranked - 1) / (len(ranked) - 1)
+        norm_reward -= 0.5
+
+        # Calculate updated network parameters
+        optimiser.zero_grad()
+        for idx, p in enumerate(net.parameters()):
+            upd_weights = np.zeros(p.data.shape)
+
+            for n, r in zip(batch_noise, norm_reward):
+                upd_weights += r * n[idx]
+
+            upd_weights /= (ES_POP * ES_SIG)
+            
+            # Set parameter gradient for optimiser
+            p.grad = torch.FloatTensor(-upd_weights)
+
+        # Optimise
+        optimiser.step()
 
         # Logging
-        print("Reward Avg: {}, Min: {}, Max: {}".format(rew_avg, rew_min, rew_max))
-        print("MSE Avg: {}, Min: {}, Max: {}".format(err_avg, err_min, err_max))
-        print("Selection Regular: {}, Flipped: {}".format(sel_avg_reg, sel_avg_flip))
-        with open(out_dir + "log_train_selector.txt", "a") as f:
-            f.write("{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(e, rew_avg, rew_min, rew_max, err_avg, err_min, err_max, sel_avg_reg, sel_min_reg, sel_max_reg, sel_avg_flip, sel_min_flip, sel_max_flip))
+        print("Training Reward Avg: {}, Min: {}, Max: {}".format(reward_avg, reward_min, reward_max))
+        with open(out_dir + "log_train.txt", "a") as f:
+            f.write("{},{},{},{}\n".format(i, reward_avg, reward_min, reward_max))
+
+        # Testing
+        if i % TEST_F == 0:
+            test_reward = test(net, TEST_E, test_env)
+            print("Test Reward Avg: {}".format(test_reward))
+            with open(out_dir + "log_test.txt", "a") as f:
+                f.write("{},{}\n".format(i, test_reward))
+
+            plot(out_dir, ENV_NAME)
+            
+            if test_reward > REW_THR:
+                print("Training complete!")
+                torch.save(net.state_dict(), out_dir + "complete.pt")
+                exit()
+
+    print("Max training steps reached.")
+    exit()
+
+def test(net, eps, env):
+    rewards = []
+    for e in range(eps):
+        state, _ = env.reset()
+        episode_reward = 0
+
+        for t in range(ENV_TRUNC):
+            dist = net(torch.tensor(state))
+            action = torch.argmax(dist.probs).item()
+            next_state, reward, done, _, _ = env.step(action)
+            state = next_state
+            episode_reward += reward
+            if done: break
         
-        # Plotting
-        if e % 10 == 0:
-            plot(out_dir, SUB_N)
-        
-        e += 1
+        rewards.append(episode_reward)
+    
+    return np.mean(rewards)
 
 if __name__ == '__main__':
     main()
-
-def es_step(self, sub_n):
-        # Queue up network params, sigs
-        subpolicy_params = self.sub_policies[sub_n].get_state_dict()
-        for _ in range(self.subpolicy_pop):
-            input = WorkerInput(subpolicy_params, self.sub_policies[sub_n].sigma, self.selector.state_dict(), sub_n)
-            self.input_queue.put(input)
-
-        # Get rewards and seeds from workers
-        batch_noise = []
-        batch_reward = []
-        batch_env_flipped = []
-        batch_sels = []
-        batch_sel_vecs = []
-        for _ in range(self.subpolicy_pop):
-            output = self.output_queue.get()
-            np.random.seed(output.seed)
-            noise = sample_noise(self.sub_policies[sub_n].policy)
-            batch_noise.append(noise)
-            batch_reward.append(output.total_reward)
-            batch_env_flipped.append(output.flipped)
-            batch_sels.append(output.sel_avg)
-            batch_sel_vecs.append(output.sel_vec)
-        
-        reward_avg = np.mean(batch_reward)
-        reward_max = np.max(batch_reward)
-        reward_min = np.min(batch_reward)
-
-        # Average by env type
-        rewards_reg = []
-        rewards_flip = []
-        sels_reg = []
-        sels_flip = []
-        for i, flipped in enumerate(batch_env_flipped):
-            if not flipped:
-                rewards_reg.append(batch_reward[i])
-                sels_reg.append(batch_sels[i])
-            else:
-                rewards_flip.append(batch_reward[i])
-                sels_flip.append(batch_sels[i])
-        
-        reward_avg_reg = np.mean(rewards_reg)
-        reward_max_reg = np.max(rewards_reg)
-        reward_min_reg = np.min(rewards_reg)
-        reward_avg_flip = np.mean(rewards_flip)
-        reward_max_flip = np.max(rewards_flip)
-        reward_min_flip = np.min(rewards_flip)
-
-        sel_avg_reg = np.mean(sels_reg)
-        sel_avg_flip = np.mean(sels_flip)
-
-        sel_centre = np.mean(batch_sel_vecs, 0)[sub_n]
-        trimmed_rewards = []
-        trimmed_noise = []
-        for i, sel_vec in enumerate(batch_sel_vecs):
-            if sel_vec[sub_n] > sel_centre:
-                trimmed_rewards.append(batch_reward[i])
-                trimmed_noise.append(batch_noise[i])
-
-        norm_trimmed = self.normalised_rank(trimmed_rewards)
-
-        # Calculate updated network parameters
-        self.sub_policies[sub_n].optimizer.zero_grad()
-        for idx, p in enumerate(self.sub_policies[sub_n].policy.parameters()):
-            upd_weights = np.zeros(p.data.shape)
-
-            for n, r in zip(trimmed_noise, norm_trimmed):
-                upd_weights += r * n[idx]
-
-            upd_weights /= (self.subpolicy_pop * self.sub_policies[sub_n].sigma)
-            
-            # Set parameter gradient for optimizer
-            p.grad = torch.FloatTensor(-upd_weights)
-
-        # Optimize
-        self.sub_policies[sub_n].optimizer.step()
-        
-        return reward_avg, reward_min, reward_max, reward_avg_reg, reward_min_reg, reward_max_reg, reward_avg_flip, reward_min_flip, reward_max_flip, sel_avg_reg, sel_avg_flip

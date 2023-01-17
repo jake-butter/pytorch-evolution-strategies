@@ -1,16 +1,22 @@
+from collections import namedtuple
 import torch
+import torch.multiprocessing as mp
+import numpy as np
+import gym
+from network import ESPolicyNetwork
 
-WorkerInput = namedtuple("WorkerInput", ("subpolicy_params", "sigma", "selector_params", "n"))
-WorkerOutput = namedtuple("WorkerOutput", ("total_reward", "seed", "flipped", "sel_avg", "sel_vec"))
+WorkerInput = namedtuple("WorkerInput", ("policy_params", "sigma"))
+WorkerOutput = namedtuple("WorkerOutput", ("total_reward", "seed"))
 
 class Worker(mp.Process):
-    def __init__(self, input_queue, output_queue):
+    def __init__(self, input_queue, output_queue, env_name, env_trunc):
         super(Worker, self).__init__()
         self.input_queue = input_queue
         self.output_queue = output_queue
 
-        self.env = CartPoleFlip()
-        self.local_subpolicy = SubPolicyNetwork(self.env.observation_space.shape, self.env.action_space.n)
+        self.env = gym.make(env_name)
+        self.env_trunc = env_trunc
+        self.local_policy = ESPolicyNetwork(self.env.observation_space.shape, self.env.action_space.n)
     
     def run(self):
         while True:
@@ -18,25 +24,22 @@ class Worker(mp.Process):
 
             if input != None:
                 # Load network params
-                self.local_subpolicy.load_state_dict(input.subpolicy_params)
-
-                # Sample noise using a random seed
-                seed = np.random.randint(1e6)
-                np.random.seed(seed)
-                noise = self.sample_noise(self.local_subpolicy)
+                self.local_policy.load_state_dict(input.policy_params)
 
                 # Apply noise to worker subpolicy network
-                for n, p in zip(noise, self.local_subpolicy.parameters()):
+                seed = np.random.randint(1e6)
+                np.random.seed(seed)
+                for p in self.local_policy.parameters():
+                    n = np.random.normal(size = p.data.numpy().shape)
                     p.data += torch.FloatTensor(n * input.sigma)
                 
                 # Evaluate noisy subpolicy
-                state = self.env.reset()
                 episode_reward = 0
-
-                for t in range(500):
-                    dist = self.local_subpolicy(torch.tensor(state))
+                state, _ = self.env.reset()
+                for t in range(self.env_trunc):
+                    dist = self.local_policy(torch.tensor(state))
                     action = dist.sample().item()
-                    next_state, reward, done, _ = self.env.step(action)
+                    next_state, reward, done, _, _ = self.env.step(action)
                     state = next_state
                     episode_reward += reward
                     if done: break
@@ -45,11 +48,11 @@ class Worker(mp.Process):
                 self.output_queue.put(output)
             
             else: break
-    
-    def sample_noise(self, net):
-        # Sample noise for each parameter of the provided network
-        nn_noise = []
-        for n in net.parameters():
-            noise = np.random.normal(size=n.data.numpy().shape)
-            nn_noise.append(noise)
-        return np.array(nn_noise, dtype=object)
+
+def sample_noise(net):
+    # Sample noise for each parameter of the provided network
+    nn_noise = []
+    for n in net.parameters():
+        noise = np.random.normal(size=n.data.numpy().shape)
+        nn_noise.append(noise)
+    return np.array(nn_noise, dtype=object)
