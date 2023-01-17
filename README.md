@@ -6,3 +6,7 @@ gym, torch, scipy, pandas, matplotlib
 
 ## Usage
 Change parameters inside `es.py` and run.
+
+## Example runs
+![CartPole](https://github.com/jake-butter/pytorch-evolution-strategies/raw/master/examples/cartpole.png)
+![Acrobot](https://github.com/jake-butter/pytorch-evolution-strategies/raw/master/examples/acrobot.png)
