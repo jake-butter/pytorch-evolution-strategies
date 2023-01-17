@@ -48,11 +48,3 @@ class Worker(mp.Process):
                 self.output_queue.put(output)
             
             else: break
-
-def sample_noise(net):
-    # Sample noise for each parameter of the provided network
-    nn_noise = []
-    for n in net.parameters():
-        noise = np.random.normal(size=n.data.numpy().shape)
-        nn_noise.append(noise)
-    return np.array(nn_noise, dtype=object)
