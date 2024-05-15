@@ -4,7 +4,7 @@ import numpy as np
 import scipy.stats as ss
 import torch
 import torch.multiprocessing as mp
-import gym
+import gymnasium as gym
 from worker import Worker, WorkerInput, sample_noise
 from network import ESPolicyNetwork
 from plot import plot

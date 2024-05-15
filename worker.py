@@ -2,7 +2,7 @@ from collections import namedtuple
 import torch
 import torch.multiprocessing as mp
 import numpy as np
-import gym
+import gymnasium as gym
 from network import ESPolicyNetwork
 
 WorkerInput = namedtuple("WorkerInput", ("policy_params", "sigma"))
